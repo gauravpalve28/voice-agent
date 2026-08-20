@@ -1,0 +1,52 @@
+# ============================================================
+# React / Vite Frontend — .gitignore
+# ============================================================
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Vite cache
+.vite/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Runtime / OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+
+# Optional: local package manager stores
+.pnpm-store/
+.yarn/
+
+
+# ============================================================
+# Python virtual environments
+# ============================================================
+venv/
+.venv/
+env/
+.venv*/

@@ -1,0 +1,22 @@
+{
+    "name": "@micdrop/poc-frontend",
+    "version": "1.0.0",
+    "description": "Micdrop POC Frontend - Voice-to-Voice AI Assistant UI",
+    "scripts": {
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview"
+    },
+    "dependencies": {
+        "@micdrop/client": "^2.2.4",
+        "@micdrop/react": "^1.0.3",
+        "lucide-react": "^1.7.0",
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0",
+        "webrtc-adapter": "^8.2.2"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-react": "^5.0.2",
+        "vite": "^7.1.5"
+    }
+}

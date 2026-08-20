@@ -1,0 +1,58 @@
+# Repo-wide ignores for backend + frontend local development
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.vite/
+.pnpm-store/
+.yarn/
+.npm/
+
+# Python / backend
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Logs / reports / temp files
+*.log
+logs/
+coverage/
+htmlcov/
+*.tmp
+*.temp
+.cache/
+.temp/
+
+# IDE / editor / OS
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local databases / artifacts
+*.db
+*.sqlite
+*.sqlite3
