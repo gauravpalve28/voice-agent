@@ -30,7 +30,7 @@ async def tts_route(
     return await tts_handler(body)
 
 
-# ── WebSocket: Full pipeline (STT → OpenAI → TTS) ────────────────────────────
+# ── WebSocket: Full pipeline (STT → Groq → TTS) ──────────────────────────────
 
 @router.websocket('/call')
 async def call_ws(

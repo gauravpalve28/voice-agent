@@ -6,7 +6,9 @@ load_dotenv()
 
 class _Env:
     PORT: int = int(os.getenv('PORT', '8000'))
-    OPENAI_API_KEY: str = os.getenv('OPENAI_API_KEY', '')
+    GROQ_API_KEY: str = os.getenv('GROQ_API_KEY', '')
+    GROQ_BASE_URL: str = os.getenv('GROQ_BASE_URL', 'https://api.groq.com/openai/v1')
+    GROQ_MODEL: str = os.getenv('GROQ_MODEL', 'llama-3.1-8b-instant')
     GLADIA_API_KEY: str = os.getenv('GLADIA_API_KEY', '')
 
     # ElevenLabs (TTS)

@@ -3,7 +3,7 @@ call_controller.py — Ultra-low-latency voice pipeline for Nue Voice Bot.
 
 Pipeline:
   WebSocket audio (PCM) → DSP preprocessing → STT (Lemonfox)
-  → OpenAI GPT stream → sentence splitter → concurrent TTS prefetch
+  → Groq LLM stream → sentence splitter → concurrent TTS prefetch
   → ordered audio sender → WebSocket PCM → browser speaker
 
 Key design decisions:
@@ -42,7 +42,7 @@ from ..utils.audio import (
 # Configuration constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Safety-net timeout. Micdrop VAD fires StopSpeaking at ~700ms silence;
+# Safety-net timeout. Micdrop VAD fires StopSpeaking at ~500ms silence;
 # this only triggers if the client never sends StopSpeaking.
 SILENCE_TIMEOUT_MS    = 1200
 
@@ -51,6 +51,9 @@ SILENCE_TIMEOUT_MS    = 1200
 RMS_NOISE_FLOOR       = 60
 
 # Samples-above-threshold gate for _has_speech()
+# SPEECH_THRESHOLD lowered from 500 → 300: 500 rejected normal conversational
+# speech amplitudes from many real microphones.
+# MIN_SAMPLES_ABOVE kept at 25 for robust noise rejection.
 SPEECH_THRESHOLD      = 300
 MIN_SAMPLES_ABOVE     = 15
 
@@ -63,7 +66,7 @@ PCM_BIT_DEPTH         = 16
 TTS_READ_TIMEOUT      = 20.0
 
 # LLM configuration
-LLM_MODEL             = 'gpt-4o-mini'
+LLM_MODEL             = env.GROQ_MODEL
 LLM_MAX_TOKENS        = 200          # enough for 2-3 natural sentences
 LLM_TEMPERATURE       = 0.7
 
@@ -241,7 +244,10 @@ async def stream_sentences(token_gen):
 async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     """Full ultra-low-latency voice pipeline: audio → STT → LLM → TTS → audio."""
 
-    openai_client        = AsyncOpenAI(api_key=env.OPENAI_API_KEY)
+    llm_client           = AsyncOpenAI(
+        base_url=env.GROQ_BASE_URL,
+        api_key=env.GROQ_API_KEY,
+    )
     conversation_history : list[dict] = []
 
     # ── Session mutable state ────────────────────────────────────────────────
@@ -249,7 +255,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     audio_chunks       : list[bytes]              = []
     silence_task       : Optional[asyncio.Task]   = None
     tts_gen            : int                      = 0            # cancellation token
-    openai_stream_task : Optional[asyncio.Task]   = None
+    llm_stream_task    : Optional[asyncio.Task]   = None
     audio_sender_task  : Optional[asyncio.Task]   = None
     audio_segments_q   : asyncio.Queue            = asyncio.Queue(maxsize=32)
     user_stop_time     : Optional[float]          = None
@@ -327,7 +333,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _cancel_active_generation() -> None:
-        nonlocal tts_gen, openai_stream_task, audio_sender_task
+        nonlocal tts_gen, llm_stream_task, audio_sender_task
         old_gen  = tts_gen
         tts_gen += 1
 
@@ -336,9 +342,9 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
             log_header("TASK CANCELLED", C_RED)
             log_body("Previous AI response cancelled successfully", C_RED)
 
-        if openai_stream_task and not openai_stream_task.done():
-            openai_stream_task.cancel()
-        openai_stream_task = None
+        if llm_stream_task and not llm_stream_task.done():
+            llm_stream_task.cancel()
+        llm_stream_task = None
 
         if audio_sender_task and not audio_sender_task.done():
             audio_sender_task.cancel()
@@ -614,13 +620,13 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _llm_stream_reader(messages: list[dict], gen: int) -> None:
-        """Stream tokens from OpenAI, split into sentences, prefetch TTS concurrently."""
+        """Stream tokens from Groq, split into sentences, prefetch TTS concurrently."""
         nonlocal conversation_history, llm_latency_ms
 
         t_llm = time.monotonic()
 
         try:
-            response = await openai_client.chat.completions.create(
+            response = await llm_client.chat.completions.create(
                 model       = LLM_MODEL,
                 messages    = messages,
                 max_tokens  = LLM_MAX_TOKENS,
@@ -628,7 +634,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                 stream      = True,
             )
 
-            # ── Token generator (wraps OpenAI async stream) ──────────────────
+            # Token generator (wraps Groq async stream)
             async def _token_gen():
                 nonlocal llm_latency_ms
                 first_token = True
@@ -705,7 +711,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
         await _start_assistant_turn(user_text=text)
 
     async def _start_assistant_turn(user_text: Optional[str]) -> None:
-        nonlocal openai_stream_task, audio_sender_task
+        nonlocal llm_stream_task, audio_sender_task
         nonlocal tts_started_logged
 
         _cancel_active_generation()
@@ -731,7 +737,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
 
         # Launch sender FIRST so it's ready to receive segments immediately
         audio_sender_task  = asyncio.create_task(_audio_sender(gen))
-        openai_stream_task = asyncio.create_task(_llm_stream_reader(messages, gen))
+        llm_stream_task = asyncio.create_task(_llm_stream_reader(messages, gen))
 
     # ─────────────────────────────────────────────────────────────────────────
     # WebSocket main receive loop

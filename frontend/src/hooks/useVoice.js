@@ -224,6 +224,21 @@ export function useVoice() {
                     volumeSilenceDuration:        700,    // matches Silero window (ms)
                 },
                 noiseCancellation: true,
+                // ── Browser-native audio cleanup BEFORE VAD sees the signal ──────
+                // echoCancellation MUST be true — without it, Neura's speaker audio
+                // bleeds into the mic and gets sent as "user speech". Micdrop's own
+                // noiseCancellation only handles ambient noise, NOT speaker echo.
+                // autoGainControl is disabled: AGC can boost background noise to the
+                // same level as speech, defeating the volumeThreshold gate.
+                mediaStreamConstraints: {
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl:  false,
+                        channelCount:     1,
+                        sampleRate:       16000,
+                    },
+                },
             })
 
             console.log('%c[NOISE FILTERED]   Silero VAD + volume gate active', S.noise)

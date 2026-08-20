@@ -19,25 +19,24 @@ from .routes.voice import router as voice_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # ── Startup: validate required API keys ───────────────────────────────────
+    # Startup: validate required API keys
     missing = []
-    if not env.OPENAI_API_KEY:
-        missing.append('OPENAI_API_KEY')
+    if not env.GROQ_API_KEY:
+        missing.append('GROQ_API_KEY')
     if not env.LEMONFOX_API_KEY:
         missing.append('LEMONFOX_API_KEY')
     if missing:
         raise RuntimeError(
             f'Missing required environment variables: {", ".join(missing)}. '
-            'Set them in Nue-VoiceBot-backend/.env before starting.'
+            'Set them in backend/.env before starting.'
         )
-    print(f'[startup] Config OK — OpenAI + Lemonfox keys present ✓')
+    print('[startup] Config OK - Groq + Lemonfox keys present')
     yield
-    # ── Shutdown (nothing to clean up) ────────────────────────────────────────
 
 
 app = FastAPI(title='Voice Bot API', version='1.0.0', lifespan=lifespan)
 
-# ── CORS — allow all origins so external apps can call the API ────────────────
+# CORS: allow all origins so external apps can call the API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=['*'],
@@ -45,12 +44,10 @@ app.add_middleware(
     allow_headers=['Content-Type', 'X-API-Key', 'Authorization'],
 )
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# Routes
 app.include_router(voice_router, prefix='/api')
 
 
 @app.get('/api/health')
 async def health():
     return {'status': 'ok', 'timestamp': datetime.now(timezone.utc).isoformat()}
-
-
