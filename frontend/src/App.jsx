@@ -117,7 +117,7 @@ function statusColor(state) {
 
 function statusLabel(state) {
     if (!state.isStarted)           return 'Not connected'
-    if (state.isAssistantSpeaking) return 'Neura is speaking…'
+    if (state.isAssistantSpeaking) return 'Gaurav is speaking…'
     if (state.isUserSpeaking)      return 'Listening…'
     if (state.isProcessing)        return 'Processing…'
     return 'Ready'
@@ -184,7 +184,7 @@ export default function App() {
             {/* Header */}
             <header style={css.header}>
                 <div style={css.dot(statusColor(state))} />
-                <h1 style={css.headerTitle}>Neura</h1>
+                <h1 style={css.headerTitle}>Gaurav</h1>
                 <span style={css.headerStatus}>{statusLabel(state)}</span>
             </header>
 
@@ -198,7 +198,7 @@ export default function App() {
                     messages.map((msg, i) => (
                         <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                             <span style={css.roleLabel(msg.role)}>
-                                {msg.role === 'user' ? 'You' : 'Neura'}
+                                {msg.role === 'user' ? 'You' : 'Gaurav'}
                             </span>
                             <div style={css.bubble(msg.role)}>
                                 {msg.content}
