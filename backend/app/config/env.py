@@ -31,5 +31,8 @@ class _Env:
     # Comma-separated API keys seeded into the registry on startup (survive restarts)
     SEEDED_API_KEYS: str = os.getenv('SEEDED_API_KEYS', '')
 
+    # MongoDB for agent tools + conversation logging
+    MONGODB_URI: str = os.getenv('MONGODB_URI', 'mongodb://localhost:27017')
+
 
 env = _Env()

@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config.env import env
 from .routes.voice import router as voice_router
+from .agent.db import connect_db, close_db
 
 
 @asynccontextmanager
@@ -31,7 +32,14 @@ async def lifespan(_app: FastAPI):
             'Set them in backend/.env before starting.'
         )
     print('[startup] Config OK - Groq + Lemonfox keys present')
+
+    # Connect MongoDB + seed mock data
+    await connect_db()
+
     yield
+
+    # Shutdown: close MongoDB
+    await close_db()
 
 
 app = FastAPI(title='Voice Bot API', version='1.0.0', lifespan=lifespan)

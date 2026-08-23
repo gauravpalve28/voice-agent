@@ -28,7 +28,9 @@ from typing import Optional
 
 import httpx
 from fastapi import WebSocket, WebSocketDisconnect
-from openai import AsyncOpenAI
+
+from ..agent.agent import run_agent_streaming, FALLBACK_STT_RESPONSE, FALLBACK_ERROR_RESPONSE
+from ..agent.logger import SessionLogger
 
 from ..config.env import env
 from ..utils.audio import (
@@ -70,43 +72,15 @@ MIN_AUDIO_BYTES       = 16_000
 # TTS HTTP read timeout. Generous to handle slow Lemonfox cold-starts.
 TTS_READ_TIMEOUT      = 20.0
 
-# LLM configuration
-LLM_MODEL             = env.GROQ_MODEL
-LLM_MAX_TOKENS        = 200          # enough for 2-3 natural sentences
-LLM_TEMPERATURE       = 0.7
 
+# Prompts (STT only — agent prompt lives in agent/agent.py)
 # ─────────────────────────────────────────────────────────────────────────────
-# Prompts
-# ─────────────────────────────────────────────────────────────────────────────
-
-_SYSTEM_PROMPT = """\
-You are Gaurav, a warm and intelligent AI voice assistant built by Flash.
-
-Conversation rules:
-- Respond in 1 to 3 short, spoken sentences. Never more unless the user explicitly asks.
-- Do NOT use markdown, bullet points, numbered lists, or any formatting that sounds unnatural aloud.
-- Do NOT start with filler phrases like "Certainly!", "Of course!", "Great question!", or "Sure!".
-- Do NOT repeat the user's question back to them before answering.
-- Be helpful, direct, and conversational — like a knowledgeable friend, not a formal assistant.
-- Keep sentences short. Avoid compound sentences that are hard to parse while listening.
-- Do not assist with harmful, illegal, or abusive requests.
-- If the user says goodbye, respond warmly in one short sentence and end naturally.
-"""
-
-_GREETING_PROMPT = (
-    "Greet the user in exactly one warm, natural sentence. "
-    "Introduce yourself as Gaurav, a voice assistant. "
-    "Keep it under 12 words."
-)
 
 # Calibrated for conversational English voice input.
-# Provides domain vocabulary hints to the Whisper-based STT model.
-# NOTE: Do NOT add instructions like "return empty for noise" — Whisper
-# interprets them as a bias toward returning empty on ANY uncertain audio,
-# causing valid speech to be silently dropped.
 _STT_INITIAL_PROMPT = (
-    "Transcript of a voice conversation with an AI assistant. "
-    "The speaker uses natural conversational English."
+    "Transcript of a voice conversation with a customer support agent. "
+    "The speaker uses natural conversational English. "
+    "Common topics include orders, deliveries, cancellations, and support tickets."
 )
 
 
@@ -245,13 +219,10 @@ async def stream_sentences(token_gen):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
-    """Full ultra-low-latency voice pipeline: audio → STT → LLM → TTS → audio."""
+    """Full ultra-low-latency voice pipeline: audio → STT → Agent → TTS → audio."""
 
-    llm_client           = AsyncOpenAI(
-        base_url=env.GROQ_BASE_URL,
-        api_key=env.GROQ_API_KEY,
-    )
     conversation_history : list[dict] = []
+    session_logger       = SessionLogger()
 
     # ── Session mutable state ────────────────────────────────────────────────
     state              : str                      = 'listening'
@@ -347,8 +318,16 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
         old_gen  = tts_gen
         tts_gen += 1
 
-        # Only log cancellation if we were actually processing or speaking
-        if state in ('processing', 'speaking'):
+        # Only log cancellation if a previous turn's tasks were actually
+        # still running. `state` can't be used here — the caller (e.g.
+        # _trigger_stt) has often already flipped it to 'processing' for
+        # the CURRENT turn before this runs, which would always look like
+        # something was cancelled even on a fresh turn with nothing live.
+        had_live_task = (
+            (llm_stream_task and not llm_stream_task.done()) or
+            (audio_sender_task and not audio_sender_task.done())
+        )
+        if had_live_task:
             log_header("TASK CANCELLED", C_RED)
             log_body("Previous AI response cancelled successfully", C_RED)
 
@@ -487,7 +466,8 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
         if text:
             await _handle_user_turn(text)
         else:
-            await _set_state('listening')
+            # STT returned empty — speak fallback instead of going silent
+            await _handle_empty_stt()
 
     # ─────────────────────────────────────────────────────────────────────────
     # TTS concurrent prefetcher
@@ -640,34 +620,27 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     # LLM streaming reader
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _llm_stream_reader(messages: list[dict], gen: int) -> None:
-        """Stream tokens from Groq, split into sentences, prefetch TTS concurrently."""
+    async def _agent_stream_reader(user_text: str | None, gen: int) -> None:
+        """Run LangChain agent, stream tokens, split into sentences, prefetch TTS."""
         nonlocal conversation_history, llm_latency_ms
 
         t_llm = time.monotonic()
 
         try:
-            response = await llm_client.chat.completions.create(
-                model       = LLM_MODEL,
-                messages    = messages,
-                max_tokens  = LLM_MAX_TOKENS,
-                temperature = LLM_TEMPERATURE,
-                stream      = True,
-            )
-
-            # Token generator (wraps Groq async stream)
+            # Token generator from the LangChain agent
             async def _token_gen():
                 nonlocal llm_latency_ms
                 first_token = True
-                async for chunk in response:
+                async for token in run_agent_streaming(
+                    conversation_history, user_text, session_logger
+                ):
                     if gen != tts_gen:
                         break
-                    delta = (chunk.choices[0].delta.content or '') if chunk.choices else ''
-                    if delta:
+                    if token:
                         if first_token:
                             first_token = False
                             llm_latency_ms = (time.monotonic() - t_llm) * 1000
-                        yield delta
+                        yield token
 
             # ── Sentence streaming + concurrent TTS prefetch ─────────────────
             collected_sentences : list[str] = []
@@ -682,11 +655,10 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                 asyncio.create_task(_prefetch_tts(sentence, gen, seg))
                 await audio_segments_q.put(seg)
 
-            # ── End-of-turn sentinel ─────────────────────────────────────────
+            # ── End-of-turn handling ─────────────────────────────────────────
             if gen == tts_gen:
-                await audio_segments_q.put(None)
-
                 full_reply = ' '.join(collected_sentences).strip()
+
                 if full_reply:
                     conversation_history.append({'role': 'assistant', 'content': full_reply})
                     if len(conversation_history) > 40:
@@ -699,6 +671,23 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                     log_header("ASSISTANT", C_CYAN)
                     log_body(full_reply, C_CYAN)
 
+                    # Log agent response
+                    total_ms = (time.monotonic() - t_llm) * 1000
+                    await session_logger.log_agent_response(full_reply, total_ms)
+
+                    await audio_segments_q.put(None)   # end-of-turn sentinel
+                else:
+                    # Agent produced no text (e.g. empty LLM response) — speak a
+                    # fallback instead of leaving the caller with dead air.
+                    log_header("AGENT EMPTY", C_YELLOW)
+                    log_body("Agent produced no text — speaking fallback", C_YELLOW)
+                    await session_logger.log_error("agent", "Empty agent response")
+
+                    seg = AudioSegment(text_preview=FALLBACK_ERROR_RESPONSE)
+                    asyncio.create_task(_prefetch_tts(FALLBACK_ERROR_RESPONSE, gen, seg))
+                    await audio_segments_q.put(seg)
+                    await audio_segments_q.put(None)   # end-of-turn sentinel
+
         except asyncio.CancelledError:
             try:
                 audio_segments_q.put_nowait(None)
@@ -706,11 +695,20 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                 pass
         except Exception as exc:
             log_header("ERROR", C_RED)
-            log_body(f"LLM stream reader error: {exc}", C_RED)
+            log_body(f"Agent stream reader error: {exc}", C_RED)
+            await session_logger.log_error("agent", str(exc))
+
+            # Fallback: speak a generic error message instead of crashing
             try:
-                audio_segments_q.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+                seg = AudioSegment(text_preview=FALLBACK_ERROR_RESPONSE)
+                asyncio.create_task(_prefetch_tts(FALLBACK_ERROR_RESPONSE, gen, seg))
+                await audio_segments_q.put(seg)
+                await audio_segments_q.put(None)
+            except Exception:
+                try:
+                    audio_segments_q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Turn pipeline
@@ -729,7 +727,17 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
             'Message ' + json.dumps({'role': 'user', 'content': text})
         )
 
+        # Log user speech
+        await session_logger.log_user_speech(text, stt_latency_ms)
+
         await _start_assistant_turn(user_text=text)
+
+    async def _handle_empty_stt() -> None:
+        """Handle empty/unclear STT — speak a fallback instead of going silent."""
+        log_header("STT EMPTY", C_YELLOW)
+        log_body("No clear speech detected — speaking fallback", C_YELLOW)
+        await session_logger.log_error("stt", "Empty or unclear transcription")
+        await _start_assistant_turn(user_text=FALLBACK_STT_RESPONSE)
 
     async def _start_assistant_turn(user_text: Optional[str]) -> None:
         nonlocal llm_stream_task, audio_sender_task
@@ -740,25 +748,16 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
 
         await _set_state('processing')
 
-        log_header("LLM START", C_CYAN)
-        log_body("Generating AI response...", C_CYAN)
+        log_header("AGENT START", C_CYAN)
+        log_body("Running LangChain agent...", C_CYAN)
 
         log_header("TTS START", C_CYAN)
         log_body("Generating voice audio...", C_CYAN)
         tts_started_logged = True
 
-        # Build message list (system + last 20 history pairs)
-        messages : list[dict] = [{'role': 'system', 'content': _SYSTEM_PROMPT}]
-        if conversation_history:
-            messages.extend(conversation_history[-20:])
-
-        if user_text is None:
-            # Opening greeting
-            messages.append({'role': 'user', 'content': _GREETING_PROMPT})
-
         # Launch sender FIRST so it's ready to receive segments immediately
         audio_sender_task  = asyncio.create_task(_audio_sender(gen))
-        llm_stream_task = asyncio.create_task(_llm_stream_reader(messages, gen))
+        llm_stream_task = asyncio.create_task(_agent_stream_reader(user_text, gen))
 
     # ─────────────────────────────────────────────────────────────────────────
     # WebSocket main receive loop
@@ -767,6 +766,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     log_header("WS CONNECTED", C_GREEN)
     log_body("Client connected successfully", C_GREEN)
 
+    await session_logger.log_session_start()
     await _start_assistant_turn(None)   # immediate greeting
 
     try:
@@ -792,6 +792,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                     log_body("User started speaking while assistant talking", C_RED)
                     _cancel_active_generation()
                     await _set_state('listening')
+                    await session_logger.log_interruption()
 
                 # NOTE: No barge-in during 'processing' state.
                 # The user hasn't heard anything yet (LLM/TTS are still
@@ -877,5 +878,6 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     finally:
         _cancel_silence_timer()
         _cancel_active_generation()
+        await session_logger.log_session_end()
         log_header("WS DISCONNECTED", C_GREEN)
-        log_body("Client disconnected", C_GREEN)
+        log_body(f"Client disconnected | Session: {session_logger.session_id}", C_GREEN)
