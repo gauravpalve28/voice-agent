@@ -1,5 +1,5 @@
 """
-call_controller.py — Ultra-low-latency voice pipeline for Nue Voice Bot.
+call_controller.py — Ultra-low-latency voice pipeline for the customer support voice agent.
 
 Pipeline:
   WebSocket audio (PCM) → DSP preprocessing → STT (Lemonfox)

@@ -117,7 +117,7 @@ function statusColor(state) {
 
 function statusLabel(state) {
     if (!state.isStarted)           return 'Not connected'
-    if (state.isAssistantSpeaking) return 'Gaurav is speaking…'
+    if (state.isAssistantSpeaking) return 'Flash is speaking…'
     if (state.isUserSpeaking)      return 'Listening…'
     if (state.isProcessing)        return 'Processing…'
     return 'Ready'
@@ -184,7 +184,7 @@ export default function App() {
             {/* Header */}
             <header style={css.header}>
                 <div style={css.dot(statusColor(state))} />
-                <h1 style={css.headerTitle}>Gaurav</h1>
+                <h1 style={css.headerTitle}>Customer Support Agnet</h1>
                 <span style={css.headerStatus}>{statusLabel(state)}</span>
             </header>
 
