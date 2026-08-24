@@ -43,7 +43,7 @@ const S = {
     voice:   'color:#16a34a;font-weight:bold;font-size:12px;',
     noise:   'color:#94a3b8;font-size:11px;',
     user:    'color:#22c55e;font-weight:bold;font-size:13px;',
-    neura:   'color:#818cf8;font-weight:bold;font-size:13px;',
+    gaurav:   'color:#818cf8;font-weight:bold;font-size:13px;',
     llm:     'color:#8b5cf6;font-size:12px;',
     tts:     'color:#06b6d4;font-size:12px;',
     audio:   'color:#f59e0b;font-size:12px;',
@@ -71,7 +71,7 @@ function logPipeline(newState, prevState, prevConvLen) {
             if (item.role === 'user') {
                 console.log(`%c👤 [USER] "${item.content}"`, S.user)
             } else if (item.role === 'assistant') {
-                console.log(`%c🤖 [NEURA] "${item.content}"`, S.neura)
+                console.log(`%c🤖 [Gaurav] "${item.content}"`, S.gaurav)
             }
         })
     }
@@ -95,10 +95,10 @@ function logPipeline(newState, prevState, prevConvLen) {
     if (!p.isAssistantSpeaking && newState.isAssistantSpeaking) {
         _firstAudioTime = performance.now()
         const ttt = _speechEndTime ? (_firstAudioTime - _speechEndTime).toFixed(0) : '?'
-        console.log(`%c[AUDIO STREAMING]   Neura speaking — PCM stream active`, S.tts)
+        console.log(`%c[AUDIO STREAMING]   Gaurav speaking — PCM stream active`, S.tts)
         console.log(`%c[LATENCY]   StopSpeaking → First Audio: ${ttt}ms`, S.latency)
     } else if (p.isAssistantSpeaking && !newState.isAssistantSpeaking) {
-        console.log('%c[AUDIO STREAMING]   Neura finished speaking', S.tts)
+        console.log('%c[AUDIO STREAMING]   Gaurav finished speaking', S.tts)
     }
 }
 
@@ -216,14 +216,29 @@ export function useVoice() {
                     sileroVadThreshold:          0.45,   // open gate (sensitive to quiet speech)
                     sileroVadNegThreshold:        0.30,   // close gate (fast hysteresis)
                     sileroVadMinSpeechDuration:   150,    // minimum valid speech burst (ms)
-                    sileroVadMinSilenceDuration:  700,    // silence before StopSpeaking (ms)
+                    sileroVadMinSilenceDuration:  1200,   // silence before StopSpeaking (ms)
 
                     // ── Volume amplitude gate (noise pre-filter) ──────────────────
                     volumeThreshold:              7,      // blocks HVAC, fan, keyboard noise
                     volumeMinDuration:            100,    // blocks single-click spikes (ms)
-                    volumeSilenceDuration:        700,    // matches Silero window (ms)
+                    volumeSilenceDuration:        1200,   // matches Silero window (ms)
                 },
                 noiseCancellation: true,
+                // ── Browser-native audio cleanup BEFORE VAD sees the signal ──────
+                // echoCancellation MUST be true — without it, Gaurav's speaker audio
+                // bleeds into the mic and gets sent as "user speech". Micdrop's own
+                // noiseCancellation only handles ambient noise, NOT speaker echo.
+                // autoGainControl is disabled: AGC can boost background noise to the
+                // same level as speech, defeating the volumeThreshold gate.
+                mediaStreamConstraints: {
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl:  false,
+                        channelCount:     1,
+                        sampleRate:       16000,
+                    },
+                },
             })
 
             console.log('%c[NOISE FILTERED]   Silero VAD + volume gate active', S.noise)

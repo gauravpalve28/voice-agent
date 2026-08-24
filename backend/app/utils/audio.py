@@ -1,5 +1,5 @@
 """
-audio.py — Advanced PCM audio processing utilities for the Nue Voice Bot.
+audio.py — Advanced PCM audio processing utilities for the voice agent.
 
 Provides:
   - WAV header construction

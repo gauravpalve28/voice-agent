@@ -1,9 +1,9 @@
 """
-call_controller.py — Ultra-low-latency voice pipeline for Nue Voice Bot.
+call_controller.py — Ultra-low-latency voice pipeline for the customer support voice agent.
 
 Pipeline:
   WebSocket audio (PCM) → DSP preprocessing → STT (Lemonfox)
-  → OpenAI GPT stream → sentence splitter → concurrent TTS prefetch
+  → Groq LLM stream → sentence splitter → concurrent TTS prefetch
   → ordered audio sender → WebSocket PCM → browser speaker
 
 Key design decisions:
@@ -28,7 +28,9 @@ from typing import Optional
 
 import httpx
 from fastapi import WebSocket, WebSocketDisconnect
-from openai import AsyncOpenAI
+
+from ..agent.agent import run_agent_streaming, FALLBACK_STT_RESPONSE, FALLBACK_ERROR_RESPONSE
+from ..agent.logger import SessionLogger
 
 from ..config.env import env
 from ..utils.audio import (
@@ -42,15 +44,18 @@ from ..utils.audio import (
 # Configuration constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Safety-net timeout. Micdrop VAD fires StopSpeaking at ~700ms silence;
+# Safety-net timeout. Micdrop VAD fires StopSpeaking at ~1200ms silence;
 # this only triggers if the client never sends StopSpeaking.
-SILENCE_TIMEOUT_MS    = 1200
+SILENCE_TIMEOUT_MS    = 2000
 
 # Fast energy gate: chunk RMS must exceed this before we bother running
 # the full speech detection scan. Avoids wasting CPU on pure-silence frames.
 RMS_NOISE_FLOOR       = 60
 
 # Samples-above-threshold gate for _has_speech()
+# SPEECH_THRESHOLD lowered from 500 → 300: 500 rejected normal conversational
+# speech amplitudes from many real microphones.
+# MIN_SAMPLES_ABOVE kept at 25 for robust noise rejection.
 SPEECH_THRESHOLD      = 300
 MIN_SAMPLES_ABOVE     = 15
 
@@ -59,48 +64,23 @@ PCM_SAMPLE_RATE       = 16_000
 PCM_CHANNELS          = 1
 PCM_BIT_DEPTH         = 16
 
+# Minimum audio duration (in bytes) before we bother calling STT.
+# Whisper hallucinates on sub-second audio — it produces phantom words
+# like "Wow" or "Thanks" from noise. 0.5s at 16kHz/16bit = 16000 bytes.
+MIN_AUDIO_BYTES       = 16_000
+
 # TTS HTTP read timeout. Generous to handle slow Lemonfox cold-starts.
 TTS_READ_TIMEOUT      = 20.0
 
-# LLM configuration
-LLM_MODEL             = 'gpt-4o-mini'
-LLM_MAX_TOKENS        = 200          # enough for 2-3 natural sentences
-LLM_TEMPERATURE       = 0.7
 
+# Prompts (STT only — agent prompt lives in agent/agent.py)
 # ─────────────────────────────────────────────────────────────────────────────
-# Prompts
-# ─────────────────────────────────────────────────────────────────────────────
-
-_SYSTEM_PROMPT = """\
-You are Neura, a warm and intelligent AI voice assistant built by Neutrino Tech Labs.
-
-Conversation rules:
-- Respond in 1 to 3 short, spoken sentences. Never more unless the user explicitly asks.
-- Do NOT use markdown, bullet points, numbered lists, or any formatting that sounds unnatural aloud.
-- Do NOT start with filler phrases like "Certainly!", "Of course!", "Great question!", or "Sure!".
-- Do NOT repeat the user's question back to them before answering.
-- Be helpful, direct, and conversational — like a knowledgeable friend, not a formal assistant.
-- Keep sentences short. Avoid compound sentences that are hard to parse while listening.
-- Do not assist with harmful, illegal, or abusive requests.
-- If the user says goodbye, respond warmly in one short sentence and end naturally.
-"""
-
-_GREETING_PROMPT = (
-    "Greet the user in exactly one warm, natural sentence. "
-    "Introduce yourself as Neura, a voice assistant. "
-    "Keep it under 12 words."
-)
 
 # Calibrated for conversational English voice input.
-# Provides domain vocabulary hints to the Whisper-based STT model.
 _STT_INITIAL_PROMPT = (
-    "Transcript of a voice conversation with Neura, an AI voice assistant "
-    "built by Neutrino Tech Labs. The speaker uses natural conversational "
-    "English. Common topics include technology, AI, general knowledge, and "
-    "everyday questions. If the audio contains only background noise, silence, "
-    "breathing, or non-speech sounds (fans, keyboards, traffic), return an "
-    "empty string. Do not invent words, greetings, or filler phrases. "
-    "Preserve natural punctuation: commas, periods, and question marks."
+    "Transcript of a voice conversation with a customer support agent. "
+    "The speaker uses natural conversational English. "
+    "Common topics include orders, deliveries, cancellations, and support tickets."
 )
 
 
@@ -239,20 +219,27 @@ async def stream_sentences(token_gen):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
-    """Full ultra-low-latency voice pipeline: audio → STT → LLM → TTS → audio."""
+    """Full ultra-low-latency voice pipeline: audio → STT → Agent → TTS → audio."""
 
-    openai_client        = AsyncOpenAI(api_key=env.OPENAI_API_KEY)
     conversation_history : list[dict] = []
+    session_logger       = SessionLogger()
 
     # ── Session mutable state ────────────────────────────────────────────────
     state              : str                      = 'listening'
     audio_chunks       : list[bytes]              = []
     silence_task       : Optional[asyncio.Task]   = None
     tts_gen            : int                      = 0            # cancellation token
-    openai_stream_task : Optional[asyncio.Task]   = None
+    llm_stream_task    : Optional[asyncio.Task]   = None
     audio_sender_task  : Optional[asyncio.Task]   = None
     audio_segments_q   : asyncio.Queue            = asyncio.Queue(maxsize=32)
     user_stop_time     : Optional[float]          = None
+
+    # Post-speaking echo cooldown: after the assistant finishes speaking,
+    # the mic picks up residual speaker echo for ~200-400ms before the
+    # browser's echoCancellation fully suppresses it. During this window
+    # we ignore all incoming audio to prevent phantom STT turns.
+    ECHO_COOLDOWN_MS   : float                    = 400.0
+    echo_cooldown_until: float                    = 0.0
 
     # ── Latency metric collection variables ──────────────────────────────────
     stt_latency_ms     : float                    = 0.0
@@ -327,18 +314,26 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _cancel_active_generation() -> None:
-        nonlocal tts_gen, openai_stream_task, audio_sender_task
+        nonlocal tts_gen, llm_stream_task, audio_sender_task
         old_gen  = tts_gen
         tts_gen += 1
 
-        # Only log cancellation if we were actually processing or speaking
-        if state in ('processing', 'speaking'):
+        # Only log cancellation if a previous turn's tasks were actually
+        # still running. `state` can't be used here — the caller (e.g.
+        # _trigger_stt) has often already flipped it to 'processing' for
+        # the CURRENT turn before this runs, which would always look like
+        # something was cancelled even on a fresh turn with nothing live.
+        had_live_task = (
+            (llm_stream_task and not llm_stream_task.done()) or
+            (audio_sender_task and not audio_sender_task.done())
+        )
+        if had_live_task:
             log_header("TASK CANCELLED", C_RED)
             log_body("Previous AI response cancelled successfully", C_RED)
 
-        if openai_stream_task and not openai_stream_task.done():
-            openai_stream_task.cancel()
-        openai_stream_task = None
+        if llm_stream_task and not llm_stream_task.done():
+            llm_stream_task.cancel()
+        llm_stream_task = None
 
         if audio_sender_task and not audio_sender_task.done():
             audio_sender_task.cancel()
@@ -399,9 +394,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
             stt_latency_ms = (time.monotonic() - t_stt) * 1000
 
             confidence = _extract_confidence(data)
-            # Reject very low-confidence results (likely noise)
-            if confidence < 0.3 and len(text.split()) <= 2:
-                return None
+            log_body(f"STT result: '{text}' (confidence={confidence:.2f}, {len(raw_pcm)} bytes)", C_GRAY)
 
             return text or None
 
@@ -431,12 +424,21 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
         if state != 'listening':
             return
 
+        if not audio_chunks:
+            return
+
+        raw_audio = b''.join(audio_chunks)
+
+        # Reject audio shorter than 0.5s — Whisper hallucinates on tiny clips
+        if len(raw_audio) < MIN_AUDIO_BYTES:
+            audio_chunks.clear()
+            return
+
         # Fast RMS gate — skip STT if audio is essentially silence
-        if audio_chunks:
-            rms = compute_rms(b''.join(audio_chunks))
-            if rms < RMS_NOISE_FLOOR:
-                audio_chunks.clear()
-                return
+        rms = compute_rms(raw_audio)
+        if rms < RMS_NOISE_FLOOR:
+            audio_chunks.clear()
+            return
 
         has_speech = any(_has_speech(chunk) for chunk in audio_chunks)
         if not has_speech:
@@ -464,7 +466,8 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
         if text:
             await _handle_user_turn(text)
         else:
-            await _set_state('listening')
+            # STT returned empty — speak fallback instead of going silent
+            await _handle_empty_stt()
 
     # ─────────────────────────────────────────────────────────────────────────
     # TTS concurrent prefetcher
@@ -551,6 +554,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
         Transitions to 'speaking' on the first byte, then back to 'listening'
         when all segments are exhausted.
         """
+        nonlocal echo_cooldown_until
         speaking_started = False
         total_bytes      = 0
 
@@ -607,40 +611,36 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
             log_body(f"Audio sender error: {exc}", C_RED)
         finally:
             if gen == tts_gen:
+                # Set echo cooldown so the mic ignores residual speaker echo
+                echo_cooldown_until = time.monotonic() + (ECHO_COOLDOWN_MS / 1000)
+                audio_chunks.clear()   # discard any echo frames buffered during playback
                 await _set_state('listening')
 
     # ─────────────────────────────────────────────────────────────────────────
     # LLM streaming reader
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _llm_stream_reader(messages: list[dict], gen: int) -> None:
-        """Stream tokens from OpenAI, split into sentences, prefetch TTS concurrently."""
+    async def _agent_stream_reader(user_text: str | None, gen: int) -> None:
+        """Run LangChain agent, stream tokens, split into sentences, prefetch TTS."""
         nonlocal conversation_history, llm_latency_ms
 
         t_llm = time.monotonic()
 
         try:
-            response = await openai_client.chat.completions.create(
-                model       = LLM_MODEL,
-                messages    = messages,
-                max_tokens  = LLM_MAX_TOKENS,
-                temperature = LLM_TEMPERATURE,
-                stream      = True,
-            )
-
-            # ── Token generator (wraps OpenAI async stream) ──────────────────
+            # Token generator from the LangChain agent
             async def _token_gen():
                 nonlocal llm_latency_ms
                 first_token = True
-                async for chunk in response:
+                async for token in run_agent_streaming(
+                    conversation_history, user_text, session_logger
+                ):
                     if gen != tts_gen:
                         break
-                    delta = (chunk.choices[0].delta.content or '') if chunk.choices else ''
-                    if delta:
+                    if token:
                         if first_token:
                             first_token = False
                             llm_latency_ms = (time.monotonic() - t_llm) * 1000
-                        yield delta
+                        yield token
 
             # ── Sentence streaming + concurrent TTS prefetch ─────────────────
             collected_sentences : list[str] = []
@@ -655,11 +655,10 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                 asyncio.create_task(_prefetch_tts(sentence, gen, seg))
                 await audio_segments_q.put(seg)
 
-            # ── End-of-turn sentinel ─────────────────────────────────────────
+            # ── End-of-turn handling ─────────────────────────────────────────
             if gen == tts_gen:
-                await audio_segments_q.put(None)
-
                 full_reply = ' '.join(collected_sentences).strip()
+
                 if full_reply:
                     conversation_history.append({'role': 'assistant', 'content': full_reply})
                     if len(conversation_history) > 40:
@@ -672,6 +671,23 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                     log_header("ASSISTANT", C_CYAN)
                     log_body(full_reply, C_CYAN)
 
+                    # Log agent response
+                    total_ms = (time.monotonic() - t_llm) * 1000
+                    await session_logger.log_agent_response(full_reply, total_ms)
+
+                    await audio_segments_q.put(None)   # end-of-turn sentinel
+                else:
+                    # Agent produced no text (e.g. empty LLM response) — speak a
+                    # fallback instead of leaving the caller with dead air.
+                    log_header("AGENT EMPTY", C_YELLOW)
+                    log_body("Agent produced no text — speaking fallback", C_YELLOW)
+                    await session_logger.log_error("agent", "Empty agent response")
+
+                    seg = AudioSegment(text_preview=FALLBACK_ERROR_RESPONSE)
+                    asyncio.create_task(_prefetch_tts(FALLBACK_ERROR_RESPONSE, gen, seg))
+                    await audio_segments_q.put(seg)
+                    await audio_segments_q.put(None)   # end-of-turn sentinel
+
         except asyncio.CancelledError:
             try:
                 audio_segments_q.put_nowait(None)
@@ -679,11 +695,20 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                 pass
         except Exception as exc:
             log_header("ERROR", C_RED)
-            log_body(f"LLM stream reader error: {exc}", C_RED)
+            log_body(f"Agent stream reader error: {exc}", C_RED)
+            await session_logger.log_error("agent", str(exc))
+
+            # Fallback: speak a generic error message instead of crashing
             try:
-                audio_segments_q.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+                seg = AudioSegment(text_preview=FALLBACK_ERROR_RESPONSE)
+                asyncio.create_task(_prefetch_tts(FALLBACK_ERROR_RESPONSE, gen, seg))
+                await audio_segments_q.put(seg)
+                await audio_segments_q.put(None)
+            except Exception:
+                try:
+                    audio_segments_q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Turn pipeline
@@ -702,10 +727,20 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
             'Message ' + json.dumps({'role': 'user', 'content': text})
         )
 
+        # Log user speech
+        await session_logger.log_user_speech(text, stt_latency_ms)
+
         await _start_assistant_turn(user_text=text)
 
+    async def _handle_empty_stt() -> None:
+        """Handle empty/unclear STT — speak a fallback instead of going silent."""
+        log_header("STT EMPTY", C_YELLOW)
+        log_body("No clear speech detected — speaking fallback", C_YELLOW)
+        await session_logger.log_error("stt", "Empty or unclear transcription")
+        await _start_assistant_turn(user_text=FALLBACK_STT_RESPONSE)
+
     async def _start_assistant_turn(user_text: Optional[str]) -> None:
-        nonlocal openai_stream_task, audio_sender_task
+        nonlocal llm_stream_task, audio_sender_task
         nonlocal tts_started_logged
 
         _cancel_active_generation()
@@ -713,25 +748,16 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
 
         await _set_state('processing')
 
-        log_header("LLM START", C_CYAN)
-        log_body("Generating AI response...", C_CYAN)
+        log_header("AGENT START", C_CYAN)
+        log_body("Running LangChain agent...", C_CYAN)
 
         log_header("TTS START", C_CYAN)
         log_body("Generating voice audio...", C_CYAN)
         tts_started_logged = True
 
-        # Build message list (system + last 20 history pairs)
-        messages : list[dict] = [{'role': 'system', 'content': _SYSTEM_PROMPT}]
-        if conversation_history:
-            messages.extend(conversation_history[-20:])
-
-        if user_text is None:
-            # Opening greeting
-            messages.append({'role': 'user', 'content': _GREETING_PROMPT})
-
         # Launch sender FIRST so it's ready to receive segments immediately
         audio_sender_task  = asyncio.create_task(_audio_sender(gen))
-        openai_stream_task = asyncio.create_task(_llm_stream_reader(messages, gen))
+        llm_stream_task = asyncio.create_task(_agent_stream_reader(user_text, gen))
 
     # ─────────────────────────────────────────────────────────────────────────
     # WebSocket main receive loop
@@ -740,6 +766,7 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     log_header("WS CONNECTED", C_GREEN)
     log_body("Client connected successfully", C_GREEN)
 
+    await session_logger.log_session_start()
     await _start_assistant_turn(None)   # immediate greeting
 
     try:
@@ -752,24 +779,33 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
             data_bytes : Optional[bytes] = message.get('bytes') or None
             data_text  : Optional[str]   = message.get('text')  or None
 
+            # ── Echo cooldown check ────────────────────────────────────────
+            in_cooldown = time.monotonic() < echo_cooldown_until
+
             # ── Binary PCM audio frames ──────────────────────────────────────
             if data_bytes:
                 if state == 'speaking':
-                    # Barge-in: user speaks while AI is playing TTS
+                    # Barge-in: user speaks while AI is playing TTS audio.
+                    # This is the ONLY valid barge-in — the user can hear the
+                    # audio and is choosing to interrupt it.
                     log_header("INTERRUPTION DETECTED", C_RED)
                     log_body("User started speaking while assistant talking", C_RED)
                     _cancel_active_generation()
                     await _set_state('listening')
+                    await session_logger.log_interruption()
 
-                elif state == 'processing' and _has_speech(data_bytes):
-                    # Barge-in: user speaks while LLM/TTS is processing
-                    log_header("INTERRUPTION DETECTED", C_RED)
-                    log_body("User started speaking while assistant talking", C_RED)
-                    _cancel_active_generation()
-                    audio_chunks.clear()
-                    await _set_state('listening')
+                # NOTE: No barge-in during 'processing' state.
+                # The user hasn't heard anything yet (LLM/TTS are still
+                # generating), so there's nothing to interrupt. Mic noise
+                # during this window would just kill the response before
+                # the user ever hears it.
 
                 if state == 'listening':
+                    # During echo cooldown, silently discard frames — they are
+                    # residual speaker output, not real user speech.
+                    if in_cooldown:
+                        continue
+
                     audio_chunks.append(data_bytes)
                     if _has_speech(data_bytes):
                         if not user_speaking_logged:
@@ -783,7 +819,11 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
 
                 # Micdrop VAD boundary signals (not JSON)
                 if data_text == 'StartSpeaking':
-                    if state in ('speaking', 'processing'):
+                    # Ignore echo-triggered speech during cooldown
+                    if in_cooldown:
+                        continue
+                    # Only interrupt if the assistant is actively speaking
+                    if state == 'speaking':
                         log_header("INTERRUPTION DETECTED", C_RED)
                         log_body("User started speaking while assistant talking", C_RED)
                         _cancel_active_generation()
@@ -792,6 +832,11 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
                     continue
 
                 if data_text == 'StopSpeaking':
+                    # Ignore echo-triggered stop during cooldown
+                    if in_cooldown:
+                        audio_chunks.clear()
+                        continue
+                    _cancel_silence_timer()   # prevent double-fire with safety-net
                     log_header("STT START", C_GRAY)
                     log_body("Transcribing audio...", C_GRAY)
                     asyncio.create_task(_trigger_stt())
@@ -833,5 +878,6 @@ async def call_controller(websocket: WebSocket, lang: str = 'english') -> None:
     finally:
         _cancel_silence_timer()
         _cancel_active_generation()
+        await session_logger.log_session_end()
         log_header("WS DISCONNECTED", C_GREEN)
-        log_body("Client disconnected", C_GREEN)
+        log_body(f"Client disconnected | Session: {session_logger.session_id}", C_GREEN)
