@@ -1,129 +1,323 @@
 import { useState, useEffect, useRef } from 'react'
 import { useVoice } from './hooks/useVoice'
 
-// ── Inline styles (no external CSS dependency) ─────────────────────────────
+// ── Design tokens ────────────────────────────────────────────────────────────
+
+const COLORS = {
+    bgTop:     '#0b0b14',
+    bgBottom:  '#05050a',
+    glass:     'rgba(255,255,255,0.06)',
+    glassBorder: 'rgba(255,255,255,0.12)',
+    text:      '#f2f2f7',
+    textDim:   'rgba(242,242,247,0.55)',
+    accentA:   '#6366f1',   // indigo — assistant speaking
+    accentB:   '#22c55e',   // green — user speaking
+    accentC:   '#f59e0b',   // amber — processing
+    accentIdle:'#3b82f6',   // blue — idle glow
+    danger:    '#ef4444',
+}
+
+// ── Keyframes injected once ──────────────────────────────────────────────────
+
+const KEYFRAMES = `
+@keyframes orbSpin {
+    0%   { transform: rotate(0deg) scale(1); }
+    100% { transform: rotate(360deg) scale(1); }
+}
+@keyframes orbPulse {
+    0%, 100% { transform: scale(1); }
+    50%      { transform: scale(1.06); }
+}
+@keyframes orbGlowPulse {
+    0%, 100% { opacity: 0.55; transform: scale(1); }
+    50%      { opacity: 0.9;  transform: scale(1.12); }
+}
+@keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes dotBounce {
+    0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+    40%           { transform: translateY(-4px); opacity: 1; }
+}
+@keyframes ringExpand {
+    0%   { transform: scale(0.9); opacity: 0.35; }
+    100% { transform: scale(1.7); opacity: 0; }
+}
+`
+
+// ── Inline styles ────────────────────────────────────────────────────────────
 
 const css = {
     root: {
+        position: 'relative',
         display: 'flex',
         flexDirection: 'column',
         height: '100dvh',
-        maxWidth: '680px',
+        maxWidth: '720px',
         margin: '0 auto',
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        background: '#fff',
+        fontFamily: "'Inter', system-ui, -apple-system, sans-serif",
+        color: COLORS.text,
+        overflow: 'hidden',
+        background: `radial-gradient(circle at 50% -10%, #1c1c30 0%, ${COLORS.bgTop} 45%, ${COLORS.bgBottom} 100%)`,
     },
+    ambientGlow: (color) => ({
+        position: 'absolute',
+        top: '-20%',
+        left: '50%',
+        width: '480px',
+        height: '480px',
+        marginLeft: '-240px',
+        background: `radial-gradient(circle, ${color}33 0%, transparent 70%)`,
+        filter: 'blur(40px)',
+        pointerEvents: 'none',
+        transition: 'background 0.6s ease',
+        zIndex: 0,
+    }),
     header: {
-        padding: '16px 20px',
-        borderBottom: '1px solid #e5e5e5',
+        position: 'relative',
+        zIndex: 1,
+        padding: '20px 24px 12px',
         display: 'flex',
         alignItems: 'center',
         gap: '10px',
     },
     dot: (color) => ({
-        width: 10,
-        height: 10,
+        width: 8,
+        height: 8,
         borderRadius: '50%',
         background: color,
         flexShrink: 0,
+        boxShadow: `0 0 8px ${color}`,
+        transition: 'background 0.3s ease, box-shadow 0.3s ease',
     }),
     headerTitle: {
-        fontSize: 16,
+        fontSize: 15,
         fontWeight: 600,
-        color: '#111',
+        color: COLORS.text,
         margin: 0,
+        letterSpacing: '-0.01em',
     },
     headerStatus: {
         fontSize: 12,
-        color: '#888',
+        color: COLORS.textDim,
         marginLeft: 'auto',
+        fontWeight: 500,
     },
-    messages: {
-        flex: 1,
-        overflowY: 'auto',
-        padding: '20px',
+
+    // ── Orb stage (shown when conversation is empty / as a persistent hero) ──
+    stage: {
+        position: 'relative',
+        zIndex: 1,
         display: 'flex',
         flexDirection: 'column',
-        gap: '12px',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 18,
+        padding: '18px 24px',
+        flexShrink: 0,
+    },
+    orbWrap: {
+        position: 'relative',
+        width: 120,
+        height: 120,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    orbRing: (color, delay) => ({
+        position: 'absolute',
+        inset: 0,
+        borderRadius: '50%',
+        border: `1.5px solid ${color}`,
+        animation: `ringExpand 2.2s ${delay}s ease-out infinite`,
+    }),
+    orbGlow: (color) => ({
+        position: 'absolute',
+        inset: -14,
+        borderRadius: '50%',
+        background: `radial-gradient(circle, ${color}66 0%, transparent 72%)`,
+        filter: 'blur(6px)',
+        animation: 'orbGlowPulse 2.6s ease-in-out infinite',
+        transition: 'background 0.4s ease',
+    }),
+    orbCore: (spinning, pulsing) => ({
+        position: 'relative',
+        width: 92,
+        height: 92,
+        borderRadius: '50%',
+        background: 'conic-gradient(from 0deg, #6366f1, #22d3ee, #a855f7, #f59e0b, #6366f1)',
+        boxShadow: 'inset 0 0 24px rgba(255,255,255,0.25), 0 8px 30px rgba(0,0,0,0.45)',
+        animation: [
+            spinning ? 'orbSpin 6s linear infinite' : null,
+            pulsing  ? 'orbPulse 1.6s ease-in-out infinite' : null,
+        ].filter(Boolean).join(', ') || 'none',
+    }),
+    orbSheen: {
+        position: 'absolute',
+        inset: 6,
+        borderRadius: '50%',
+        background: 'radial-gradient(circle at 35% 30%, rgba(255,255,255,0.55), rgba(255,255,255,0) 55%)',
+        pointerEvents: 'none',
+    },
+    statusLabel: {
+        fontSize: 14,
+        fontWeight: 500,
+        color: COLORS.textDim,
+        letterSpacing: '0.01em',
+        transition: 'color 0.3s ease',
+    },
+
+    // ── Message list ──────────────────────────────────────────────────────────
+    messages: {
+        position: 'relative',
+        zIndex: 1,
+        flex: 1,
+        minHeight: 0,
+        overflowY: 'auto',
+        padding: '4px 20px 16px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '14px',
     },
     empty: {
         flex: 1,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        color: '#bbb',
+        color: COLORS.textDim,
         fontSize: 14,
         userSelect: 'none',
+        textAlign: 'center',
+        padding: '0 40px',
     },
+    row: (role) => ({
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+        alignItems: role === 'user' ? 'flex-end' : 'flex-start',
+        animation: 'fadeUp 0.35s ease both',
+    }),
     bubble: (role) => ({
-        maxWidth: '72%',
-        padding: '10px 14px',
-        borderRadius: role === 'user' ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-        background: role === 'user' ? '#111' : '#f1f1f1',
-        color: role === 'user' ? '#fff' : '#111',
-        fontSize: 14,
+        maxWidth: '78%',
+        padding: '11px 15px',
+        borderRadius: role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+        background: role === 'user'
+            ? 'linear-gradient(135deg, #6366f1, #4f46e5)'
+            : COLORS.glass,
+        border: role === 'user' ? 'none' : `1px solid ${COLORS.glassBorder}`,
+        backdropFilter: role === 'user' ? 'none' : 'blur(12px)',
+        color: role === 'user' ? '#fff' : COLORS.text,
+        fontSize: 14.5,
         lineHeight: 1.5,
-        alignSelf: role === 'user' ? 'flex-end' : 'flex-start',
         wordBreak: 'break-word',
+        boxShadow: role === 'user'
+            ? '0 4px 16px rgba(99,102,241,0.35)'
+            : '0 2px 12px rgba(0,0,0,0.25)',
     }),
-    roleLabel: (role) => ({
+    roleLabel: {
         fontSize: 11,
-        color: '#aaa',
-        marginBottom: 3,
-        alignSelf: role === 'user' ? 'flex-end' : 'flex-start',
+        color: COLORS.textDim,
+        padding: '0 4px',
+    },
+    typingBubble: {
+        display: 'flex',
+        gap: 4,
+        padding: '13px 16px',
+        borderRadius: '16px 16px 16px 4px',
+        background: COLORS.glass,
+        border: `1px solid ${COLORS.glassBorder}`,
+        backdropFilter: 'blur(12px)',
+        width: 'fit-content',
+    },
+    typingDot: (delay) => ({
+        width: 6,
+        height: 6,
+        borderRadius: '50%',
+        background: COLORS.textDim,
+        animation: `dotBounce 1.2s ${delay}s ease-in-out infinite`,
     }),
+
+    // ── Footer ────────────────────────────────────────────────────────────────
     footer: {
-        padding: '16px 20px',
-        borderTop: '1px solid #e5e5e5',
+        position: 'relative',
+        zIndex: 1,
+        padding: '14px 24px 26px',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        gap: '16px',
+    },
+    controls: {
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 10,
     },
     micBtn: (active, disabled) => ({
         width: 64,
         height: 64,
         borderRadius: '50%',
-        border: 'none',
+        border: `1px solid ${active ? 'rgba(239,68,68,0.5)' : COLORS.glassBorder}`,
         cursor: disabled ? 'not-allowed' : 'pointer',
-        background: active ? '#ef4444' : '#111',
+        background: active
+            ? 'linear-gradient(135deg, #ef4444, #dc2626)'
+            : 'linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04))',
+        backdropFilter: 'blur(10px)',
         color: '#fff',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         fontSize: 24,
-        boxShadow: active ? '0 0 0 6px rgba(239,68,68,0.2)' : '0 2px 8px rgba(0,0,0,0.15)',
-        transition: 'background 0.2s, box-shadow 0.2s',
+        boxShadow: active
+            ? '0 0 0 8px rgba(239,68,68,0.15), 0 4px 20px rgba(239,68,68,0.4)'
+            : '0 4px 20px rgba(0,0,0,0.4)',
+        transition: 'background 0.25s ease, box-shadow 0.25s ease, transform 0.15s ease',
         outline: 'none',
-        opacity: disabled ? 0.5 : 1,
+        opacity: disabled ? 0.4 : 1,
     }),
     hint: {
         fontSize: 12,
-        color: '#aaa',
+        color: COLORS.textDim,
         textAlign: 'center',
-        marginTop: 6,
+    },
+    errorToast: {
+        position: 'absolute',
+        top: 64,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 5,
+        background: 'rgba(239,68,68,0.15)',
+        border: '1px solid rgba(239,68,68,0.4)',
+        backdropFilter: 'blur(12px)',
+        color: '#fecaca',
+        fontSize: 13,
+        padding: '10px 16px',
+        borderRadius: 12,
+        maxWidth: '85%',
+        textAlign: 'center',
+        animation: 'fadeUp 0.3s ease both',
     },
 }
 
-// ── Status helpers ─────────────────────────────────────────────────────────
+// ── Status helpers ────────────────────────────────────────────────────────────
 
 function statusColor(state) {
-    if (!state.isStarted)           return '#bbb'
-    if (state.isAssistantSpeaking) return '#6366f1'
-    if (state.isUserSpeaking)      return '#22c55e'
-    if (state.isProcessing)        return '#f59e0b'
-    return '#22c55e'
+    if (!state.isStarted)          return 'rgba(255,255,255,0.25)'
+    if (state.isAssistantSpeaking) return COLORS.accentA
+    if (state.isUserSpeaking)      return COLORS.accentB
+    if (state.isProcessing)        return COLORS.accentC
+    return COLORS.accentB
 }
 
 function statusLabel(state) {
-    if (!state.isStarted)           return 'Not connected'
+    if (!state.isStarted)          return 'Not connected'
     if (state.isAssistantSpeaking) return 'Flash is speaking…'
     if (state.isUserSpeaking)      return 'Listening…'
-    if (state.isProcessing)        return 'Processing…'
-    return 'Ready'
+    if (state.isProcessing)        return 'Thinking…'
+    return 'Ready — say something'
 }
 
-// ── MicIcon SVG ────────────────────────────────────────────────────────────
+// ── Icons ─────────────────────────────────────────────────────────────────────
 
 function MicIcon() {
     return (
@@ -146,27 +340,50 @@ function StopIcon() {
     )
 }
 
-// ── App ────────────────────────────────────────────────────────────────────
+// ── Orb ────────────────────────────────────────────────────────────────────────
+
+function Orb({ state }) {
+    const glowColor = statusColor(state)
+    const spinning = state.isAssistantSpeaking || state.isProcessing
+    const pulsing  = state.isUserSpeaking
+    const showRings = state.isUserSpeaking || state.isAssistantSpeaking
+
+    return (
+        <div style={css.orbWrap}>
+            {showRings && (
+                <>
+                    <div style={css.orbRing(glowColor, 0)} />
+                    <div style={css.orbRing(glowColor, 0.7)} />
+                </>
+            )}
+            <div style={css.orbGlow(glowColor)} />
+            <div style={css.orbCore(spinning, pulsing)}>
+                <div style={css.orbSheen} />
+            </div>
+        </div>
+    )
+}
+
+// ── App ────────────────────────────────────────────────────────────────────────
 
 export default function App() {
-    const { state, handlers } = useVoice()
+    const { state, error, handlers } = useVoice()
     const { handleStartMic, handleStart, handleStop } = handlers
     const messagesEndRef = useRef(null)
 
     const [micReady, setMicReady] = useState(false)
 
-    // Initialise mic once on mount
     useEffect(() => {
         handleStartMic().then(() => setMicReady(true))
     }, [])
 
-    // Auto-scroll to latest message
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }, [state.conversation])
 
     const isActive = state.isStarted
-    const isBusy   = state.isAssistantSpeaking || state.isProcessing
+    const glowColor = statusColor(state)
+    const messages = state.conversation || []
 
     async function toggleCall() {
         if (isActive) {
@@ -176,29 +393,38 @@ export default function App() {
         }
     }
 
-    const messages = state.conversation || []
-
     return (
         <div style={css.root}>
+            <style>{KEYFRAMES}</style>
+
+            <div style={css.ambientGlow(glowColor)} />
+
+            {error && <div style={css.errorToast}>{error}</div>}
 
             {/* Header */}
             <header style={css.header}>
-                <div style={css.dot(statusColor(state))} />
-                <h1 style={css.headerTitle}>Customer Support Agnet</h1>
+                <div style={css.dot(glowColor)} />
+                <h1 style={css.headerTitle}>Flash · Order Support</h1>
                 <span style={css.headerStatus}>{statusLabel(state)}</span>
             </header>
+
+            {/* Orb stage */}
+            <div style={css.stage}>
+                <Orb state={state} />
+            </div>
 
             {/* Message list */}
             <div style={css.messages}>
                 {messages.length === 0 ? (
                     <div style={css.empty}>
-                        Press the mic button to start a conversation
+                        Press the mic to start — ask about an order,<br />
+                        a delivery estimate, or a cancellation.
                     </div>
                 ) : (
                     messages.map((msg, i) => (
-                        <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                            <span style={css.roleLabel(msg.role)}>
-                                {msg.role === 'user' ? 'You' : 'Gaurav'}
+                        <div key={i} style={css.row(msg.role)}>
+                            <span style={css.roleLabel}>
+                                {msg.role === 'user' ? 'You' : 'Flash'}
                             </span>
                             <div style={css.bubble(msg.role)}>
                                 {msg.content}
@@ -206,12 +432,22 @@ export default function App() {
                         </div>
                     ))
                 )}
+                {state.isProcessing && (
+                    <div style={css.row('assistant')}>
+                        <span style={css.roleLabel}>Flash</span>
+                        <div style={css.typingBubble}>
+                            <span style={css.typingDot(0)} />
+                            <span style={css.typingDot(0.15)} />
+                            <span style={css.typingDot(0.3)} />
+                        </div>
+                    </div>
+                )}
                 <div ref={messagesEndRef} />
             </div>
 
-            {/* Footer — mic button only */}
+            {/* Footer — mic button */}
             <footer style={css.footer}>
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+                <div style={css.controls}>
                     <button
                         id="mic-btn"
                         style={css.micBtn(isActive, !micReady)}
@@ -230,7 +466,6 @@ export default function App() {
                     </span>
                 </div>
             </footer>
-
         </div>
     )
 }
